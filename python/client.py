@@ -48,14 +48,20 @@ Run a worker that registers with the control plane and reassembles events:
 
 import argparse
 import os
+import re
 import sys
 import time
+from datetime import datetime
 
 import yaml
 
 import e2sar_py
 
 IP_FAMILY = {"dual": 0, "ipv4": 1, "ipv6": 2}
+
+
+def _log(msg, **kwargs):
+    print(f"[{datetime.now().strftime('%H:%M:%S.%f')}] {msg}", **kwargs)
 
 
 def _die(msg):
@@ -98,15 +104,27 @@ def _load_uri_from_yaml(path, token_type):
     return e2sar_py.EjfatURI(uri=uri_str, tt=token_type)
 
 
+def _redact_uri(uri_str):
+    return re.sub(r"(://)(.{4})[^@]*(.{4})@", r"\1\2---\3@", uri_str)
+
+
 def _load_uri(args, token_type):
     if args.uri:
-        return e2sar_py.EjfatURI(uri=args.uri, tt=token_type)
-    if args.uri_file and os.path.exists(args.uri_file):
-        return _load_uri_from_yaml(args.uri_file, token_type)
-    res = e2sar_py.EjfatURI.get_from_env(tt=token_type)
-    if res.has_error():
-        _die(f"reading EJFAT_URI: {res.error().message()}")
-    return res.value()
+        source = "--uri"
+        uri = e2sar_py.EjfatURI(uri=args.uri, tt=token_type)
+    elif args.uri_file and os.path.exists(args.uri_file):
+        source = args.uri_file
+        uri = _load_uri_from_yaml(args.uri_file, token_type)
+    else:
+        source = "EJFAT_URI environment variable"
+        res = e2sar_py.EjfatURI.get_from_env(tt=token_type)
+        if res.has_error():
+            _die(f"reading EJFAT_URI: {res.error().message()}")
+        uri = res.value()
+
+    print(f"Loading EJFAT_URI from {source}...")
+    print(f"EJFAT_URI: {_redact_uri(uri.to_string(token_type))}")
+    return uri
 
 
 # ------------------------------------------------------------- control plane
@@ -139,22 +157,46 @@ def cmd_cp_reserve(args):
 def cmd_cp_free(args):
     uri = _load_uri(args, e2sar_py.EjfatURI.TokenType.admin)
     lbm = e2sar_py.ControlPlane.LBManager(uri, not args.insecure)
+
+    print("Freeing a load balancer")
+    print(
+        f"   Contacting: {_redact_uri(uri.to_string(e2sar_py.EjfatURI.TokenType.admin))} "
+        f"using address: {lbm.get_addr_string()}"
+    )
+    print(f"   LB ID: {uri.lb_id}")
+
     _unwrap(lbm.free_lb(), "freeing load balancer")
-    print("Load balancer freed")
+    print("Success.")
+    print("Reservation freed successfully")
 
 
 def cmd_cp_status(args):
     uri = _load_uri(args, e2sar_py.EjfatURI.TokenType.admin)
     lbm = e2sar_py.ControlPlane.LBManager(uri, not args.insecure)
 
+    print("Getting LB Status")
+    print(
+        f"   Contacting: {uri.to_string(e2sar_py.EjfatURI.TokenType.session)} "
+        f"using address: {lbm.get_addr_string()}"
+    )
+    print(f"   LB ID: {uri.lb_id}")
+
     status = lbm.get_lb_status()
     if status is None:
         _die("fetching load balancer status")
 
-    print(f"Sender addresses: {lbm.get_sender_addresses(status)}")
+    lb_status = e2sar_py.ControlPlane.LBManager.as_lb_status(status)
+    print(
+        f"LB details: expiresat={lb_status.expiresAt}, currentepoch={lb_status.currentEpoch}, "
+        f"predictedeventnum={lb_status.currentPredictedEventNumber}"
+    )
+
+    print(f"Registered senders: {' '.join(lbm.get_sender_addresses(status))}")
+
+    print("Registered workers:")
     workers = lbm.get_worker_statuses(status)
     if not workers:
-        print("No workers registered")
+        print("  (none)")
     for w in workers:
         print(
             f"  worker={w.get_name()} fill={w.get_fill_percent():.2f} "
@@ -173,28 +215,79 @@ def cmd_sender(args):
     sflags.rateGbps = args.rate
     sflags.mtu = args.mtu
 
+    _log(f"E2SAR Selected Optimizations:  {' '.join(e2sar_py.Optimizations.selectedAsStrings())}")
+
+    lbm = None
+    if sflags.useCP:
+        lbm = e2sar_py.ControlPlane.LBManager(uri, not args.insecure)
+        _log("Adding senders to LB: autodetected ... ", end="", flush=True)
+        _unwrap(lbm.add_sender_self(False), "adding sender to LB")
+        print("done")
+
+    _log(f"Control plane:                 {'ON' if sflags.useCP else 'OFF'}")
+    _log(f"Sending sockets/threads:       {sflags.numSendSockets}")
+    if sflags.rateGbps > 0:
+        _log(f"Sending average bit rate is:   {sflags.rateGbps} Gbps (with {args.size} B line-rate bursts)")
+        _log(f"Inter-event sleep (usec) is:   {int(args.size * 8 / (sflags.rateGbps * 1000))}")
+    else:
+        _log("Sending average bit rate is:   unlimited")
+    _log(
+        "*** Make sure the LB has been reserved and the URI reflects the reserved instance information."
+        if sflags.useCP
+        else "*** Make sure the URI reflects proper data address, other parts are ignored."
+    )
+    _log(f"Event size is {args.size} bytes or {args.size * 8} bits")
+    _log(f"Sending {args.count} event buffers" if args.count > 0 else "Sending events until Ctrl-C")
+
     seg = e2sar_py.DataPlane.Segmenter(uri, args.data_id, args.event_src_id, sflags)
     _unwrap(seg.OpenAndStart(), "starting segmenter")
-    print(f"Segmenter started, sending events of {args.size} bytes every {args.interval}s")
+    _log(f"Using MTU {seg.getMTU()}")
 
     payload = os.urandom(args.size)
     sent = 0
+    start = time.perf_counter()
     try:
         while args.count <= 0 or sent < args.count:
             _unwrap(seg.sendEvent(payload, len(payload)), "sending event")
             sent += 1
             if sent % 10 == 0:
                 stats = seg.getSendStats()
-                print(f"sent {sent} events, {stats.msgCnt} fragments, {stats.errCnt} errors")
+                _log(f"sent {sent} events, {stats.msgCnt} fragments, {stats.errCnt} errors")
             time.sleep(args.interval)
     except KeyboardInterrupt:
         pass
     finally:
+        elapsed = time.perf_counter() - start
+        _log("Stopping threads")
         seg.stopThreads()
-        print(f"Sender stopped after {sent} events")
+
+        stats = seg.getSendStats()
+        _log(f"Completed, {stats.msgCnt} packets sent, {stats.errCnt} errors")
+        _log(f"Elapsed usecs: {int(elapsed * 1_000_000)} microseconds")
+        if elapsed > 0:
+            effective_gbps = stats.msgCnt * seg.getMTU() * 8 / elapsed / 1e9
+            goodput_gbps = sent * args.size * 8 / elapsed / 1e9
+            _log(f"Estimated effective throughput (Gbps): {effective_gbps:.6f}")
+            _log(f"Estimated goodput (Gbps): {goodput_gbps:.6f}")
+
+        if lbm is not None:
+            _log("Removing senders: self")
+            _unwrap(lbm.remove_sender_self(False), "removing sender from LB")
 
 
 # ------------------------------------------------------------------- worker
+
+def _print_worker_stats(stats):
+    _log("Stats:")
+    print(f"\tTotal Bytes: {stats.totalBytes}")
+    print(f"\tTotal Packets: {stats.totalPackets}")
+    print(f"\tBad RE Header Discards: {stats.badHeaderDiscards}")
+    print(f"\tEvents Received: {stats.eventSuccess}")
+    print(f"\tEvents Lost in reassembly: {stats.reassemblyLoss}")
+    print(f"\tEvents Lost in enqueue: {stats.enqueueLoss}")
+    print(f"\tData Errors: {stats.dataErrCnt}")
+    print(f"\tgRPC Errors: {stats.grpcErrCnt}")
+
 
 def cmd_worker(args):
     uri = _load_uri(args, e2sar_py.EjfatURI.TokenType.instance)
@@ -203,41 +296,52 @@ def cmd_worker(args):
     rflags.useCP = not args.no_cp
     rflags.weight = args.weight
 
+    cp_host, _ = _unwrap(uri.get_cp_host(), "reading control plane host")
+    cp_addr, _ = _unwrap(uri.get_cp_addr(), "reading control plane address")
+    _log(f"LB Host: {cp_host}")
+    _log(f"LB IP: {cp_addr}")
+
     if args.data_ip:
+        receiver_ip = args.data_ip
         data_ip = e2sar_py.IPAddress.from_string(args.data_ip)
         reas = e2sar_py.DataPlane.Reassembler(uri, data_ip, args.port, args.threads, rflags)
     else:
+        _log("Auto-detecting receiver IP...")
         # auto-detect the outgoing interface towards the load balancer
+        receiver_ip = uri.get_dp_local_addrs()[0]
         reas = e2sar_py.DataPlane.Reassembler(uri, args.port, args.threads, rflags)
+    _log(f"Receiver IP: {receiver_ip}")
+    _log(f"Data Port: {args.port}")
+    _log(f"Receive Threads: {args.threads}")
+    _log(f"Buffer Size: {rflags.rcvSocketBufSize}")
 
     if rflags.useCP:
         _unwrap(reas.registerWorker(args.node_name), "registering worker")
 
     _unwrap(reas.OpenAndStart(), "starting reassembler")
-    print(f"Worker '{args.node_name}' listening on port {args.port} ({args.threads} threads)")
+    _log(f"Running: worker '{args.node_name}' ip={receiver_ip} port={args.port} threads={args.threads}")
 
     received = 0
     try:
         while True:
             recv_len, recv_bytes, event_num, data_id = reas.recvEventBytes(wait_ms=200)
             if recv_len == -2:
-                print("receive error, continuing")
+                _log("receive error, continuing")
                 continue
             if recv_len == -1:
                 continue
             received += 1
-            print(f"received event #{event_num} data_id={data_id} bytes={recv_len}")
+            _log(f"received event #{event_num} data_id={data_id} bytes={recv_len}")
+            if received % 50 == 0:
+                _print_worker_stats(reas.getStats())
     except KeyboardInterrupt:
         pass
     finally:
         if rflags.useCP:
             reas.deregisterWorker()
         reas.stopThreads()
-        stats = reas.getStats()
-        print(
-            f"Worker stopped after receiving {received} events "
-            f"(reassemblyLoss={stats.reassemblyLoss}, enqueueLoss={stats.enqueueLoss})"
-        )
+        _log(f"Worker stopped after receiving {received} events")
+        _print_worker_stats(reas.getStats())
 
 
 # ---------------------------------------------------------------------- CLI
@@ -283,6 +387,7 @@ def build_parser():
     sender.add_argument("--rate", type=float, default=-1.0, help="send rate in Gbps (negative = unlimited)")
     sender.add_argument("--mtu", type=int, default=1500, help="MTU used for segmentation")
     sender.add_argument("--no-cp", action="store_true", help="disable control plane sync packets")
+    sender.add_argument("--insecure", action="store_true", help="skip TLS certificate validation")
     sender.set_defaults(func=cmd_sender)
 
     worker = sub.add_parser("worker", help="register and reassemble events")
