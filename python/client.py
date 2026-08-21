@@ -385,7 +385,10 @@ def build_parser():
     sender.add_argument("--count", type=int, default=0, help="number of events to send (0 = until Ctrl-C)")
     sender.add_argument("--interval", type=float, default=1.0, help="seconds between events")
     sender.add_argument("--rate", type=float, default=-1.0, help="send rate in Gbps (negative = unlimited)")
-    sender.add_argument("--mtu", type=int, default=1500, help="MTU used for segmentation")
+    sender.add_argument(
+        "--mtu", type=int, default=0,
+        help="MTU used for segmentation (0 = auto-detect from the outgoing interface, default)",
+    )
     sender.add_argument("--no-cp", action="store_true", help="disable control plane sync packets")
     sender.add_argument("--insecure", action="store_true", help="skip TLS certificate validation")
     sender.set_defaults(func=cmd_sender)
