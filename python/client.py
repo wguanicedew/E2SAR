@@ -59,6 +59,18 @@ import e2sar_py
 
 IP_FAMILY = {"dual": 0, "ipv4": 1, "ipv6": 2}
 
+_DEFAULT_SOCKET_BUF_SIZE = 1024 * 1024 * 3  # matches the library default (e2sarDPSegmenter/Reassembler)
+
+
+def _max_socket_buf_size(sysctl_name):
+    """Read the Linux-allowed max socket buffer size (net.core.{r,w}mem_max);
+    falls back to the library default on non-Linux or if unreadable."""
+    try:
+        with open(f"/proc/sys/net/core/{sysctl_name}") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return _DEFAULT_SOCKET_BUF_SIZE
+
 
 def _log(msg, **kwargs):
     print(f"[{datetime.now().strftime('%H:%M:%S.%f')}] {msg}", **kwargs)
@@ -230,6 +242,7 @@ def cmd_sender(args):
     sflags.useCP = not args.no_cp
     sflags.rateGbps = args.rate
     sflags.mtu = args.mtu
+    sflags.sndSocketBufSize = args.bufsize
 
     _log(f"E2SAR Selected Optimizations:  {' '.join(e2sar_py.Optimizations.selectedAsStrings())}")
 
@@ -242,6 +255,7 @@ def cmd_sender(args):
 
     _log(f"Control plane:                 {'ON' if sflags.useCP else 'OFF'}")
     _log(f"Sending sockets/threads:       {sflags.numSendSockets}")
+    _log(f"Send socket buffer size:       {sflags.sndSocketBufSize}")
     if sflags.rateGbps > 0:
         _log(f"Sending average bit rate is:   {sflags.rateGbps} Gbps (with {args.size} B line-rate bursts)")
         _log(f"Inter-event sleep (usec) is:   {int(args.size * 8 / (sflags.rateGbps * 1000))}")
@@ -310,9 +324,9 @@ def cmd_worker(args):
 
     rflags = e2sar_py.DataPlane.Reassembler.ReassemblerFlags()
     rflags.useCP = not args.no_cp
-    rflags.useCP = True
     rflags.weight = args.weight
     rflags.rcvSocketBufSize = args.bufsize
+    rflags.eventTimeout_ms = args.timeout
 
     cp_host, _ = _unwrap(uri.get_cp_host(), "reading control plane host")
     cp_addr, _ = _unwrap(uri.get_cp_addr(), "reading control plane address")
@@ -329,14 +343,16 @@ def cmd_worker(args):
         receiver_ip = uri.get_dp_local_addrs()[0]
         reas = e2sar_py.DataPlane.Reassembler(uri, args.port, args.threads, rflags)
     _log(f"Receiver IP: {receiver_ip}")
-    _log(f"Data Port: {args.port}")
     _log(f"Receive Threads: {args.threads}")
     _log(f"Buffer Size: {rflags.rcvSocketBufSize}")
+    _log(f"Event reassembly timeout (ms): {rflags.eventTimeout_ms}")
 
     if rflags.useCP:
         _unwrap(reas.registerWorker(args.node_name), "registering worker")
 
     _unwrap(reas.OpenAndStart(), "starting reassembler")
+    port_lo, port_hi = reas.get_recvPorts()
+    _log(f"Receiving on ports: {port_lo}:{port_hi}")
     _log(f"Running: worker '{args.node_name}' ip={receiver_ip} port={args.port} threads={args.threads}")
 
     received = 0
@@ -404,6 +420,10 @@ def build_parser():
     sender.add_argument("--interval", type=float, default=1.0, help="seconds between events")
     sender.add_argument("--rate", type=float, default=-1.0, help="send rate in Gbps (negative = unlimited)")
     sender.add_argument("--mtu", type=int, default=1300, help="MTU used for segmentation")
+    sender.add_argument(
+        "--bufsize", type=int, default=_max_socket_buf_size("wmem_max"),
+        help="UDP send socket buffer size in bytes (default: Linux net.core.wmem_max, or %(default)s)",
+    )
     sender.add_argument("--no-cp", action="store_true", help="disable control plane sync packets")
     sender.add_argument("--insecure", action="store_true", help="skip TLS certificate validation")
     sender.set_defaults(func=cmd_sender)
@@ -415,8 +435,14 @@ def build_parser():
     worker.add_argument("--threads", type=int, default=1, help="number of receive threads")
     worker.add_argument("--weight", type=float, default=1.0, help="worker weight for slot assignment")
     worker.add_argument("--no-cp", action="store_true", help="disable control plane registration")
-    # worker.add_argument("--bufsize", type=int, default=3145728, help="UDP receive socket buffer size in bytes")
-    worker.add_argument("--bufsize", type=int, default=100000, help="UDP receive socket buffer size in bytes")
+    worker.add_argument(
+        "--bufsize", type=int, default=_max_socket_buf_size("rmem_max"),
+        help="UDP receive socket buffer size in bytes (default: Linux net.core.rmem_max, or %(default)s)",
+    )
+    worker.add_argument(
+        "--timeout", type=int, default=500,
+        help="event reassembly timeout in ms before an incomplete event is discarded (default: %(default)s)",
+    )
     worker.set_defaults(func=cmd_worker)
 
     return parser
