@@ -50,6 +50,7 @@ import argparse
 import os
 import re
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -60,16 +61,38 @@ import e2sar_py
 IP_FAMILY = {"dual": 0, "ipv4": 1, "ipv6": 2}
 
 _DEFAULT_SOCKET_BUF_SIZE = 1024 * 1024 * 3  # matches the library default (e2sarDPSegmenter/Reassembler)
+_SOCKET_BUF_SIZE_MARGIN = 0.7  # stay under the Linux max: each recv/send thread opens its own socket,
+# so requesting the full net.core.{r,w}mem_max per-socket over-commits kernel memory with many threads
 
 
 def _max_socket_buf_size(sysctl_name):
-    """Read the Linux-allowed max socket buffer size (net.core.{r,w}mem_max);
-    falls back to the library default on non-Linux or if unreadable."""
+    """Read a safety margin below the Linux-allowed max socket buffer size
+    (net.core.{r,w}mem_max); falls back to the library default on non-Linux or if unreadable."""
     try:
         with open(f"/proc/sys/net/core/{sysctl_name}") as f:
-            return int(f.read().strip())
+            return int(int(f.read().strip()) * _SOCKET_BUF_SIZE_MARGIN)
     except (OSError, ValueError):
         return _DEFAULT_SOCKET_BUF_SIZE
+
+
+_DEFAULT_MTU = 1300  # fallback if the outgoing interface's MTU can't be detected
+_MTU_MARGIN = 0.9  # leave headroom below the interface MTU for IP/UDP/LB/RE header overhead
+
+
+def _system_mtu():
+    """Detect the MTU of the interface used for the default route and apply a safety margin;
+    falls back to _DEFAULT_MTU on non-Linux or if detection fails."""
+    try:
+        with open("/proc/net/route") as f:
+            for line in f.readlines()[1:]:
+                fields = line.split()
+                iface, dest, flags = fields[0], fields[1], int(fields[3], 16)
+                if dest == "00000000" and flags & 0x2:  # RTF_GATEWAY
+                    with open(f"/sys/class/net/{iface}/mtu") as mf:
+                        return int(int(mf.read().strip()) * _MTU_MARGIN)
+    except (OSError, ValueError, IndexError):
+        pass
+    return _DEFAULT_MTU
 
 
 def _log(msg, **kwargs):
@@ -235,6 +258,12 @@ def cmd_cp_status(args):
 
 # ------------------------------------------------------------------- sender
 
+# markers embedded at the start/end of each sent event payload so the worker can detect
+# corruption ("Events Mangled"); same sentinel strings as e2sar_perf for interoperability.
+_EVENT_PLD_START = b"This is a start of event payload"
+_EVENT_PLD_END = b"...the end"
+
+
 def cmd_sender(args):
     uri = _load_uri(args, e2sar_py.EjfatURI.TokenType.instance)
 
@@ -273,7 +302,11 @@ def cmd_sender(args):
     _unwrap(seg.OpenAndStart(), "starting segmenter")
     _log(f"Using MTU {seg.getMTU()}")
 
-    payload = os.urandom(args.size)
+    payload = bytearray(os.urandom(args.size))
+    if len(payload) >= len(_EVENT_PLD_START) + len(_EVENT_PLD_END):
+        payload[:len(_EVENT_PLD_START)] = _EVENT_PLD_START
+        payload[len(payload) - len(_EVENT_PLD_END):] = _EVENT_PLD_END
+    payload = bytes(payload)
     sent = 0
     start = time.perf_counter()
     try:
@@ -307,20 +340,65 @@ def cmd_sender(args):
 
 # ------------------------------------------------------------------- worker
 
-def _print_worker_stats(stats):
-    _log("Stats:")
+def _print_stats_block(seq, stats, mangled, lost_events):
+    ts = datetime.now().strftime("%H:%M:%S.%f")
+    print(f"{seq}: [{ts}] {{info}} Stats:")
     print(f"\tTotal Bytes: {stats.totalBytes}")
     print(f"\tTotal Packets: {stats.totalPackets}")
     print(f"\tBad RE Header Discards: {stats.badHeaderDiscards}")
     print(f"\tEvents Received: {stats.eventSuccess}")
+    print(f"\tEvents Mangled: {mangled}")
     print(f"\tEvents Lost in reassembly: {stats.reassemblyLoss}")
     print(f"\tEvents Lost in enqueue: {stats.enqueueLoss}")
     print(f"\tData Errors: {stats.dataErrCnt}")
     print(f"\tgRPC Errors: {stats.grpcErrCnt}")
+    lost_str = " ".join(f"<{evt_num}:{data_id}/{num_frags}>" for evt_num, data_id, num_frags in lost_events)
+    print(f"\tEvents lost so far (<Evt ID:Data ID/num frags rcvd>): {lost_str}")
+
+
+def _is_mangled(recv_bytes):
+    return (
+        len(recv_bytes) >= len(_EVENT_PLD_START) + len(_EVENT_PLD_END)
+        and (
+            recv_bytes[:len(_EVENT_PLD_START)] != _EVENT_PLD_START
+            or recv_bytes[len(recv_bytes) - len(_EVENT_PLD_END):] != _EVENT_PLD_END
+        )
+    )
+
+
+def _worker_deq_loop(reas, stop_event, counters_lock, counters):
+    while not stop_event.is_set():
+        recv_len, recv_bytes, event_num, data_id = reas.recvEventBytes(wait_ms=200)
+        if recv_len == -2:
+            _log("receive error, continuing")
+            continue
+        if recv_len == -1:
+            continue
+        mangled = _is_mangled(recv_bytes)
+        with counters_lock:
+            counters["received"] += 1
+            if mangled:
+                counters["mangled"] += 1
+
+
+def _worker_stats_thread(reas, stop_event, period_ms, counters_lock, counters, lost_events):
+    seq = 0
+    while not stop_event.wait(period_ms / 1000):
+        while True:
+            evt = reas.get_LostEvent()
+            if not evt:
+                break
+            lost_events.append(evt)
+        with counters_lock:
+            mangled = counters["mangled"]
+        _print_stats_block(seq, reas.getStats(), mangled, lost_events)
+        seq += 1
 
 
 def cmd_worker(args):
     uri = _load_uri(args, e2sar_py.EjfatURI.TokenType.instance)
+
+    deq_threads = args.deq if args.deq is not None else args.threads
 
     rflags = e2sar_py.DataPlane.Reassembler.ReassemblerFlags()
     rflags.useCP = not args.no_cp
@@ -344,6 +422,7 @@ def cmd_worker(args):
         reas = e2sar_py.DataPlane.Reassembler(uri, args.port, args.threads, rflags)
     _log(f"Receiver IP: {receiver_ip}")
     _log(f"Receive Threads: {args.threads}")
+    _log(f"Dequeue Threads: {deq_threads}")
     _log(f"Buffer Size: {rflags.rcvSocketBufSize}")
     _log(f"Event reassembly timeout (ms): {rflags.eventTimeout_ms}")
 
@@ -355,27 +434,43 @@ def cmd_worker(args):
     _log(f"Receiving on ports: {port_lo}:{port_hi}")
     _log(f"Running: worker '{args.node_name}' ip={receiver_ip} port={args.port} threads={args.threads}")
 
-    received = 0
+    stop_event = threading.Event()
+    counters_lock = threading.Lock()
+    counters = {"received": 0, "mangled": 0}
+    lost_events = []
+    deq_pool = [
+        threading.Thread(target=_worker_deq_loop, args=(reas, stop_event, counters_lock, counters), daemon=True)
+        for _ in range(deq_threads)
+    ]
+    stats_thread = threading.Thread(
+        target=_worker_stats_thread,
+        args=(reas, stop_event, args.period, counters_lock, counters, lost_events),
+        daemon=True,
+    )
+    for t in deq_pool:
+        t.start()
+    stats_thread.start()
+
     try:
         while True:
-            recv_len, recv_bytes, event_num, data_id = reas.recvEventBytes(wait_ms=200)
-            if recv_len == -2:
-                _log("receive error, continuing")
-                continue
-            if recv_len == -1:
-                continue
-            received += 1
-            _log(f"received event #{event_num} data_id={data_id} bytes={recv_len}")
-            if received % 50 == 0:
-                _print_worker_stats(reas.getStats())
+            time.sleep(0.2)
     except KeyboardInterrupt:
         pass
     finally:
+        stop_event.set()
+        for t in deq_pool:
+            t.join()
+        stats_thread.join()
         if rflags.useCP:
             reas.deregisterWorker()
         reas.stopThreads()
-        _log(f"Worker stopped after receiving {received} events")
-        _print_worker_stats(reas.getStats())
+        while True:
+            evt = reas.get_LostEvent()
+            if not evt:
+                break
+            lost_events.append(evt)
+        _log(f"Worker stopped after receiving {counters['received']} events")
+        _print_stats_block("final", reas.getStats(), counters["mangled"], lost_events)
 
 
 # ---------------------------------------------------------------------- CLI
@@ -419,7 +514,10 @@ def build_parser():
     sender.add_argument("--count", type=int, default=0, help="number of events to send (0 = until Ctrl-C)")
     sender.add_argument("--interval", type=float, default=1.0, help="seconds between events")
     sender.add_argument("--rate", type=float, default=-1.0, help="send rate in Gbps (negative = unlimited)")
-    sender.add_argument("--mtu", type=int, default=1300, help="MTU used for segmentation")
+    sender.add_argument(
+        "--mtu", type=int, default=_system_mtu(),
+        help="MTU used for segmentation (default: 90%% of the outgoing interface's MTU, or %(default)s)",
+    )
     sender.add_argument(
         "--bufsize", type=int, default=_max_socket_buf_size("wmem_max"),
         help="UDP send socket buffer size in bytes (default: Linux net.core.wmem_max, or %(default)s)",
@@ -433,6 +531,10 @@ def build_parser():
     worker.add_argument("--data-ip", default=None, help="IP to listen on (default: auto-detect)")
     worker.add_argument("--port", type=int, default=10000, help="starting UDP port to listen on")
     worker.add_argument("--threads", type=int, default=1, help="number of receive threads")
+    worker.add_argument(
+        "--deq", type=int, default=None,
+        help="number of dequeue threads pulling reassembled events (default: same as --threads)",
+    )
     worker.add_argument("--weight", type=float, default=1.0, help="worker weight for slot assignment")
     worker.add_argument("--no-cp", action="store_true", help="disable control plane registration")
     worker.add_argument(
@@ -442,6 +544,10 @@ def build_parser():
     worker.add_argument(
         "--timeout", type=int, default=500,
         help="event reassembly timeout in ms before an incomplete event is discarded (default: %(default)s)",
+    )
+    worker.add_argument(
+        "--period", type=int, default=1000,
+        help="stats reporting thread sleep period in ms (default: %(default)s)",
     )
     worker.set_defaults(func=cmd_worker)
 
