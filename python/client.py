@@ -71,7 +71,7 @@ def _die(msg):
 
 def _unwrap(res, what):
     if res.has_error():
-        _die(f"{what}: {res.error().message()}")
+        _die(f"{what}: {res.error().message}")
     return res.value()
 
 
@@ -116,7 +116,23 @@ def _load_uri(args, token_type):
         source = args.uri_file
         uri = _load_uri_from_yaml(args.uri_file, token_type)
     else:
-        source = "EJFAT_URI environment variable"
+        key = _TOKEN_TYPE_KEYS[token_type]
+
+        if key == "admin_uri":
+            print("Load EJFAT_URI")
+            source = "EJFAT_URI environment variable"
+        elif key == "instance_uri":
+            print("Load INSTANCE_URI to EJFAT_URI")
+            instance_uri = os.environ.get("INSTANCE_URI")
+            if not instance_uri:
+                raise RuntimeError(
+                    "INSTANCE_URI environment variable is not set"
+                )
+            os.environ["EJFAT_URI"] = instance_uri
+            source = "INSTANCE_URI environment variable"
+        else:
+            raise RuntimeError(f"Unsupported token type: {token_type}")
+
         res = e2sar_py.EjfatURI.get_from_env(tt=token_type)
         if res.has_error():
             _die(f"reading EJFAT_URI: {res.error().message()}")
@@ -294,7 +310,9 @@ def cmd_worker(args):
 
     rflags = e2sar_py.DataPlane.Reassembler.ReassemblerFlags()
     rflags.useCP = not args.no_cp
+    rflags.useCP = True
     rflags.weight = args.weight
+    rflags.rcvSocketBufSize = args.bufsize
 
     cp_host, _ = _unwrap(uri.get_cp_host(), "reading control plane host")
     cp_addr, _ = _unwrap(uri.get_cp_addr(), "reading control plane address")
@@ -385,10 +403,7 @@ def build_parser():
     sender.add_argument("--count", type=int, default=0, help="number of events to send (0 = until Ctrl-C)")
     sender.add_argument("--interval", type=float, default=1.0, help="seconds between events")
     sender.add_argument("--rate", type=float, default=-1.0, help="send rate in Gbps (negative = unlimited)")
-    sender.add_argument(
-        "--mtu", type=int, default=0,
-        help="MTU used for segmentation (0 = auto-detect from the outgoing interface, default)",
-    )
+    sender.add_argument("--mtu", type=int, default=1300, help="MTU used for segmentation")
     sender.add_argument("--no-cp", action="store_true", help="disable control plane sync packets")
     sender.add_argument("--insecure", action="store_true", help="skip TLS certificate validation")
     sender.set_defaults(func=cmd_sender)
@@ -400,6 +415,8 @@ def build_parser():
     worker.add_argument("--threads", type=int, default=1, help="number of receive threads")
     worker.add_argument("--weight", type=float, default=1.0, help="worker weight for slot assignment")
     worker.add_argument("--no-cp", action="store_true", help="disable control plane registration")
+    # worker.add_argument("--bufsize", type=int, default=3145728, help="UDP receive socket buffer size in bytes")
+    worker.add_argument("--bufsize", type=int, default=100000, help="UDP receive socket buffer size in bytes")
     worker.set_defaults(func=cmd_worker)
 
     return parser
@@ -413,3 +430,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
