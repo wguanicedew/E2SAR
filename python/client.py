@@ -398,7 +398,7 @@ def _worker_stats_thread(reas, stop_event, period_ms, counters_lock, counters, l
 def cmd_worker(args):
     uri = _load_uri(args, e2sar_py.EjfatURI.TokenType.instance)
 
-    deq_threads = args.deq if args.deq is not None else args.threads
+    deq_threads = (args.deq if args.deq is not None else args.threads) if args.deq_threads else 1
 
     rflags = e2sar_py.DataPlane.Reassembler.ReassemblerFlags()
     rflags.useCP = not args.no_cp
@@ -422,7 +422,7 @@ def cmd_worker(args):
         reas = e2sar_py.DataPlane.Reassembler(uri, args.port, args.threads, rflags)
     _log(f"Receiver IP: {receiver_ip}")
     _log(f"Receive Threads: {args.threads}")
-    _log(f"Dequeue Threads: {deq_threads}")
+    _log(f"Dequeue Threads: {deq_threads} ({'pool' if args.deq_threads else 'single, main thread'})")
     _log(f"Buffer Size: {rflags.rcvSocketBufSize}")
     _log(f"Event reassembly timeout (ms): {rflags.eventTimeout_ms}")
 
@@ -441,7 +441,7 @@ def cmd_worker(args):
     deq_pool = [
         threading.Thread(target=_worker_deq_loop, args=(reas, stop_event, counters_lock, counters), daemon=True)
         for _ in range(deq_threads)
-    ]
+    ] if args.deq_threads else []
     stats_thread = threading.Thread(
         target=_worker_stats_thread,
         args=(reas, stop_event, args.period, counters_lock, counters, lost_events),
@@ -452,8 +452,14 @@ def cmd_worker(args):
     stats_thread.start()
 
     try:
-        while True:
-            time.sleep(0.2)
+        if args.deq_threads:
+            while True:
+                time.sleep(0.2)
+        else:
+            # single dequeue loop in the main thread: the recvEventBytes pybind
+            # binding doesn't release the GIL during its blocking wait, so a pool
+            # of Python threads calling it adds contention without real parallelism
+            _worker_deq_loop(reas, stop_event, counters_lock, counters)
     except KeyboardInterrupt:
         pass
     finally:
@@ -532,8 +538,15 @@ def build_parser():
     worker.add_argument("--port", type=int, default=10000, help="starting UDP port to listen on")
     worker.add_argument("--threads", type=int, default=1, help="number of receive threads")
     worker.add_argument(
+        "--deq-threads", action="store_true",
+        help="dequeue reassembled events using a pool of --deq Python threads instead of a single "
+        "loop in the main thread. Disabled by default: the recvEventBytes binding doesn't release "
+        "the GIL during its blocking wait, so multiple dequeue threads serialize on the GIL rather "
+        "than running in parallel, and can make throughput/responsiveness worse, not better.",
+    )
+    worker.add_argument(
         "--deq", type=int, default=None,
-        help="number of dequeue threads pulling reassembled events (default: same as --threads)",
+        help="number of dequeue threads when --deq-threads is set (default: same as --threads)",
     )
     worker.add_argument("--weight", type=float, default=1.0, help="worker weight for slot assignment")
     worker.add_argument("--no-cp", action="store_true", help="disable control plane registration")
